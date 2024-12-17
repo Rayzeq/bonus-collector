@@ -1,17 +1,22 @@
+#!/bin/env python3
+
 import argparse
+import logging
+from getpass import getpass
+from time import sleep, time
+
 from rbrapi import RocketBotRoyale
-from rbrapi.errors import AuthenticationError, CollectTimedBonusError, LootBoxError
-from logger import Logger
-from time import sleep
+from rbrapi.errors import APIError, AuthenticationError, PasswordTooShortError
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RocketBotRoyale bonus collector.")
     parser.add_argument("--email", type=str, help="Email for RocketBotRoyale account")
     parser.add_argument(
-        "--password", type=str, help="Password for RocketBotRoyale account"
+        "--password",
+        type=str,
+        help="Password for RocketBotRoyale account",
     )
-    parser.add_argument("--no-logging", action="store_true", help="Disable logging")
     parser.add_argument(
         "--auto-open-crates",
         action="store_true",
@@ -20,41 +25,73 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
 
-    email = args.email if args.email else input("Enter email: ")
-    password = args.password if args.password else input("Enter password: ")
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    handler.flush()
 
-    if args.no_logging:
-        logger = None
-    else:
-        logger = Logger(__name__)
+    return logger
+
+
+def mainloop(
+    logger: logging.Logger,
+    email: str,
+    password: str,
+    *,
+    auto_open_crates: bool,
+) -> None:
+    client = RocketBotRoyale(email, password)
 
     while True:
         try:
-            client = RocketBotRoyale(email, password)
-
             client.collect_timed_bonus()
-            logger.info("Coins collected successfully.")
+            logger.info("Coins collected successfully")
+        except APIError:
+            logger.info("Bonus not available yet")
 
-            coins = client.account().wallet["coins"]
-            logger.info(f"Your coins now: {coins}.")
+        account_data = client.account()
+        # print(account_data)
+        coins = account_data.wallet["coins"]
+        logger.info("Your coins now: %s", coins)
 
-            if args.auto_open_crates and coins >= 1000:
+        if auto_open_crates and coins >= 1000:
+            try:
                 award = client.buy_crate()
-                logger.info(f"Crate award is: {award.award_id}")
+                logger.info("Crate award is: %s", award.award_id)
+            except APIError:
+                logger.exception("Unable to open crates")
 
-        except AuthenticationError as e:
-            logger.error(f"Unable to authenticate: {e}")
-        except CollectTimedBonusError as e:
-            logger.info(f"Bonus not available to claim yet: {e}")
-        except LootBoxError as e:
-            logger.error(f"Unable to open crates: {e}")
-        except Exception as e:
-            logger.exception(f"An unexpected error occurred: {e}")
-        finally:
-            sleep(60 * 5)
+        last_collect = account_data.user["metadata"]["timed_bonus_last_collect"]
+
+        while time() < last_collect + 30 * 60:
+            sleep(60)
+
+
+def main() -> None:
+    args = parse_args()
+
+    email = args.email if args.email else input("Enter email: ")
+    password = args.password if args.password else getpass()
+
+    logger = get_logger(__name__)
+
+    while True:
+        try:
+            mainloop(logger, email, password, auto_open_crates=args.auto_open_crates)
+        except AuthenticationError as e:  # noqa: PERF203
+            if e.message != "Auth token invalid":
+                logger.error("Unable to authenticate: %s", e.message)  # noqa: TRY400
+                return
+        except PasswordTooShortError as e:
+            logger.error("Invalid password: %s", e.message)  # noqa: TRY400
+            return
+        except Exception:
+            logger.exception("Unexpected exception")
 
 
 if __name__ == "__main__":
